@@ -3,6 +3,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use std::io::{Write, stdin, stdout};
+use tokio::process::Command;
 
 #[derive(Default)]
 struct ToolCall {
@@ -11,7 +12,9 @@ struct ToolCall {
     args: String,
 }
 
-fn run_tool(name: &str, args: &str) -> String {
+const MAX: usize = 3000;
+
+async fn run_tool(name: &str, args: &str) -> String {
     let a: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let out = match name {
         "read_file" => {
@@ -27,9 +30,34 @@ fn run_tool(name: &str, args: &str) -> String {
                 Err(e) => format!("error: {e}"),
             }
         }
+        "bash" => {
+            let Some(cmd) = a["command"].as_str() else {
+                return "error: missing 'command'".into();
+            };
+            match Command::new("sh").arg("-c").arg(cmd).output().await {
+                Ok(o) => format!(
+                    "exit: {}\nstdout:\n{}\nstderr:\n{}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                ),
+                Err(e) => format!("error: {e}"),
+            }
+        }
         _ => format!("unknown tool: {name}"),
     };
-    out.chars().take(8000).collect()
+    truncate(out, MAX)
+}
+
+fn truncate(s: String, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s;
+    }
+    let half = max / 2;
+    let head: String = s.chars().take(half).collect();
+    let tail: String = s.chars().skip(n - half).collect();
+    format!("{head}\n...[{} chars truncated]...\n{tail}", n - max)
 }
 
 #[tokio::main]
@@ -65,7 +93,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "required": ["path", "content"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command and return exit code, stdout and stderr.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                    },
+                    "required": ["command"]
+                }
+            }
         }
+
     ]);
 
     loop {
@@ -90,6 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }))
                 .send()
                 .await?;
+
+            if !resp.status().is_success() {
+                eprintln!("{}: {}", resp.status(), resp.text().await?);
+                break;
+            }
 
             let mut stream = resp.bytes_stream().eventsource();
             let mut calls: Vec<ToolCall> = vec![];
@@ -149,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for c in &calls {
                 println!("[tool] {}({})", c.name, c.args);
-                let out = run_tool(&c.name, &c.args);
+                let out = run_tool(&c.name, &c.args).await;
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": c.id,
